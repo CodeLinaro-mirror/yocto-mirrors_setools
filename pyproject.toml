@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "setools"
-version = "4.7.0"
+version = "4.7.1"
 description="SELinux policy analysis tools."
 authors = [{name = "Chris PeBenito", email="pebenito@ieee.org"}]
 license = "LGPL-2.1-only AND GPL-2.0-only"
@@ -45,7 +45,7 @@ dependencies = []
 optional-dependencies.analysis = ["networkx>=2.6",
                                   "pygraphviz"]
 optional-dependencies.gui = ["PyQt6"]
-optional-dependencies.mcp = ["mcp>=1.0"]
+optional-dependencies.mcp = ["fastmcp>=2.0"]
 optional-dependencies.test = ["tox"]
 
 [tool.setuptools]

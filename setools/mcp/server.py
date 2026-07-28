@@ -10,13 +10,14 @@ import logging
 from typing import Annotated, Any, Final, Literal
 
 try:
-    from mcp.server.fastmcp import FastMCP
+    from fastmcp import FastMCP
 except ImportError as iex:
     logging.getLogger(__name__).debug(f"{iex.name} failed to import.")
 
 from .. import (BoolQuery, BoundsQuery, BoundsRuletype, CategoryQuery, CommonQuery,
                 ConstraintQuery, ConstraintRuletype, DefaultQuery, DefaultRuletype,
-                DevicetreeconQuery, DomainTransitionAnalysis, FSUseQuery, FSUseRuletype,
+                DevicetreeconQuery, DomainTransitionAnalysis, FileContexts,
+                FileContextsFiletype, FSUseQuery, FSUseRuletype,
                 GenfsconQuery, IbendportconQuery, IbpkeyconQuery, IbpkeyconRange,
                 InfoFlowAnalysis, InitialSIDQuery, IomemconQuery, IomemconRange,
                 IoportconQuery, IoportconRange, MLSRuleQuery, MLSRuletype, NetifconQuery,
@@ -29,7 +30,8 @@ from .encoder import MCPEncoder
 
 __all__ = ("MCPEncoder",)
 
-TOOL_PREFIX: Final[str] = "setools_"
+TOOL_PREFIX: Final[str] = "setools_tool_"
+PROMPT_PREFIX: Final[str] = "setools_prompt_"
 
 
 class DiffComponent(str, enum.Enum):
@@ -52,6 +54,13 @@ class PolicyCache(dict):
         return self[key]
 
 
+class FileContextsCache(dict):
+    """Simple cache for loaded file_contexts"""
+    def __missing__(self, key: str | None) -> FileContexts:
+        self[key] = FileContexts(None, key)
+        return self[key]
+
+
 class SEToolsMCPServer:
     """
     MCP server encapsulating all setools policy analysis tools.
@@ -64,6 +73,7 @@ class SEToolsMCPServer:
         self.log: logging.Logger = logging.getLogger(__name__)
         self.default_policy: str | None = default_policy
         self._policy_cache: PolicyCache = PolicyCache()
+        self._fc_cache: FileContextsCache = FileContextsCache()
 
         try:
             # Init the policy cache.  Load the default policy as the None key and its path.
@@ -79,21 +89,28 @@ class SEToolsMCPServer:
             instructions=(
                 "SELinux policy analysis tools built on the setools library.  "
                 "Supports querying TE/RBAC/MLS rules, enumerating policy components, "
-                "domain transition analysis, information flow analysis, and policy diffing."
+                "domain transition analysis, information flow analysis, policy diffing,"
+                "and file_context lookup."
             ),
         )
 
         for name in dir(self):
             if name.startswith(TOOL_PREFIX) and callable(getattr(self, name)):
+                self.log.info(f"Registering tool: {name}")
                 self.mcp.tool()(getattr(self, name))
+            elif name.startswith(PROMPT_PREFIX) and callable(getattr(self, name)):
+                self.log.info(f"Registering prompt: {name}")
+                self.mcp.prompt()(getattr(self, name))
 
-    def run(self, transport: Literal["stdio", "sse", "streamable-http"] = "stdio",
+    def run(self, transport: Literal["stdio", "http"] = "stdio",
             host: str = "127.0.0.1", port: int = 8000) -> None:
         """Start the MCP server with the given transport."""
-        if transport == "sse":
-            self.mcp.settings.host = host
-            self.mcp.settings.port = port
-        self.mcp.run(transport=transport)
+        if transport == "http":
+            self.log.info(f"Running MCP server over HTTP at {host}:{port}")
+            self.mcp.run(transport=transport, host=host, port=port)
+        else:
+            self.log.info("Running MCP server over stdio")
+            self.mcp.run(transport=transport)
 
     #
     # Helpers
@@ -112,6 +129,13 @@ class SEToolsMCPServer:
                                                    returned_count,
                                                    truncated)
 
+    def _load_file_contexts(self, fc_path: str | None = None) -> FileContexts:
+        """
+        Return a (cached) FileContexts for file_contexts at path *fc_path*.
+        If *fc_path* is None, uses the system default file_contexts.
+        """
+        return self._fc_cache[fc_path]
+
     def _load_policy(self, policy: str | None = None) -> SELinuxPolicy:
         """
         Return a (cached) SELinuxPolicy for policy at path *policy*.
@@ -129,9 +153,48 @@ class SEToolsMCPServer:
                           indent=2)
 
     #
+    # Prompts
+    #
+    def setools_prompt_summarize(
+        self,
+        name: Annotated[str, "Domain (type) or program to summarize access for."],
+    ) -> str:
+        """Summarize the access of a domain (type) or program."""
+        return \
+            f"Summarize the access of {name}.  If this cannot be resolved to a type" \
+            "attempt to look up the executable type in file_contexts and if this is an" \
+            "entrypoint type, summarize the access of the related domain."
+
+    def setools_prompt_cve(
+        self,
+        cve: Annotated[str, "CVE identifier, e.g., CVE-2026-31431"],
+    ) -> str:
+        """Find domains might be vulnerable to a CVE."""
+        return \
+            "Based on the attached SELinux policy, what programs may be able to exploit " \
+            f"{cve}. Do not speculate."
+
+    def setools_prompt_dta_out(
+        self,
+        name: Annotated[str, "Domain (type) to summarize transitions for."],
+    ) -> str:
+        """List the transitions out of a domain (type)."""
+        return \
+            f"List the direct transitions out of {name}."
+
+    def setools_prompt_dta_in(
+        self,
+        name: Annotated[str, "Domain (type) to summarize transitions for."],
+    ) -> str:
+        """List the transitions into a domain (type)."""
+        return \
+            f"List the direct transitions into {name}."
+
+    #
     # MCP Tools
     #
-    def setools_get_policy_info(
+
+    def setools_tool_get_policy_info(
         self,
         policy_path: Annotated[
             str | None,
@@ -142,7 +205,7 @@ class SEToolsMCPServer:
         """Return statistics and metadata about an SELinux policy."""
         return self._serialize_results(self._load_policy(policy_path), 1, False)
 
-    def setools_search_te_rules(
+    def setools_tool_search_te_rules(
         self,
         ruletypes: Annotated[
             list[str] | None,
@@ -212,7 +275,7 @@ class SEToolsMCPServer:
 
         return self._collect_results(q, max_results=max_results)
 
-    def setools_search_rbac_rules(
+    def setools_tool_search_rbac_rules(
         self,
         ruletypes: Annotated[
             list[str] | None,
@@ -254,7 +317,7 @@ class SEToolsMCPServer:
 
         return self._collect_results(q, max_results=max_results)
 
-    def setools_search_mls_rules(
+    def setools_tool_search_mls_rules(
         self,
         ruletypes: Annotated[
             list[str] | None,
@@ -283,7 +346,7 @@ class SEToolsMCPServer:
 
         return self._collect_results(q, max_results=max_results)
 
-    def setools_list_types(
+    def setools_tool_list_types(
         self,
         name: Annotated[str | None, "Type name (or regex pattern) to filter by. "] = None,
         name_regex: Annotated[bool, "Treat name as a regular expression."] = False,
@@ -315,7 +378,7 @@ class SEToolsMCPServer:
 
         return self._collect_results(q, max_results=max_results)
 
-    def setools_list_type_attributes(
+    def setools_tool_list_type_attributes(
         self,
         name: Annotated[str | None, "Attribute name (or regex pattern) to filter by."] = None,
         name_regex: Annotated[bool, "Treat name as a regular expression."] = False,
@@ -334,7 +397,7 @@ class SEToolsMCPServer:
 
         return self._collect_results(q, max_results=max_results)
 
-    def setools_list_roles(
+    def setools_tool_list_roles(
         self,
         name: Annotated[str | None, "Role name (or regex pattern) to filter by."] = None,
         name_regex: Annotated[bool, "Treat name as a regular expression."] = False,
@@ -353,7 +416,7 @@ class SEToolsMCPServer:
 
         return self._collect_results(q, max_results=max_results)
 
-    def setools_list_role_types(
+    def setools_tool_list_role_types(
         self,
         type_name: Annotated[str, "Type name (or regex pattern) to find associated roles for."],
         type_regex: Annotated[bool, "Treat type_name as a regular expression."] = False,
@@ -372,7 +435,7 @@ class SEToolsMCPServer:
 
         return self._collect_results(q, max_results=max_results)
 
-    def setools_list_users(
+    def setools_tool_list_users(
         self,
         name: Annotated[
             str | None, "User name (or regex pattern) to filter by."
@@ -393,7 +456,7 @@ class SEToolsMCPServer:
 
         return self._collect_results(q, max_results=max_results)
 
-    def setools_list_classes(
+    def setools_tool_list_classes(
         self,
         name: Annotated[
             str | None, "Class name (or regex pattern) to filter by."
@@ -414,7 +477,7 @@ class SEToolsMCPServer:
 
         return self._collect_results(q, max_results=max_results)
 
-    def setools_list_commons(
+    def setools_tool_list_commons(
         self,
         name: Annotated[
             str | None, "Common name (or regex pattern) to filter by."
@@ -430,7 +493,7 @@ class SEToolsMCPServer:
 
         return self._collect_results(q, max_results=max_results)
 
-    def setools_list_booleans(
+    def setools_tool_list_booleans(
         self,
         name: Annotated[
             str | None, "Boolean name (or regex pattern) to filter by."
@@ -453,7 +516,7 @@ class SEToolsMCPServer:
 
         return self._collect_results(q, max_results=max_results)
 
-    def setools_list_sensitivities(
+    def setools_tool_list_sensitivities(
         self,
         name: Annotated[
             str | None, "Sensitivity name (or regex pattern) to filter by."
@@ -476,7 +539,7 @@ class SEToolsMCPServer:
 
         return self._collect_results(q, max_results=max_results)
 
-    def setools_list_categories(
+    def setools_tool_list_categories(
         self,
         name: Annotated[
             str | None, "Category name (or regex pattern) to filter by."
@@ -499,7 +562,7 @@ class SEToolsMCPServer:
 
         return self._collect_results(q, max_results=max_results)
 
-    def setools_list_polcaps(
+    def setools_tool_list_polcaps(
         self,
         name: Annotated[
             str | None, "Policy capability name (or regex pattern) to filter by."
@@ -515,7 +578,7 @@ class SEToolsMCPServer:
 
         return self._collect_results(q, max_results=max_results)
 
-    def setools_list_permissive_types(
+    def setools_tool_list_permissive_types(
         self,
         name: Annotated[
             str | None, "Type name (or regex pattern) to filter by."
@@ -533,7 +596,7 @@ class SEToolsMCPServer:
 
         return self._collect_results(q, max_results=max_results)
 
-    def setools_list_typebounds(
+    def setools_tool_list_typebounds(
         self,
         child: Annotated[
             str | None, "Bound (child) type name (or regex pattern) to filter by."
@@ -561,7 +624,7 @@ class SEToolsMCPServer:
 
         return self._collect_results(q, max_results=max_results)
 
-    def setools_list_constraints(
+    def setools_tool_list_constraints(
         self,
         tclass: Annotated[
             list[str] | None,
@@ -590,7 +653,7 @@ class SEToolsMCPServer:
 
         return self._collect_results(q, max_results=max_results)
 
-    def setools_list_defaults(
+    def setools_tool_list_defaults(
         self,
         tclass: Annotated[
             list[str] | None, "Object class(es) to filter by."
@@ -613,7 +676,7 @@ class SEToolsMCPServer:
 
         return self._collect_results(q, max_results=max_results)
 
-    def setools_list_fs_uses(
+    def setools_tool_list_fs_uses(
         self,
         fs: Annotated[
             str | None, "Filesystem type name (or regex pattern) to filter by."
@@ -636,7 +699,7 @@ class SEToolsMCPServer:
 
         return self._collect_results(q, max_results=max_results)
 
-    def setools_list_genfscons(
+    def setools_tool_list_genfscons(
         self,
         fs: Annotated[
             str | None, "Filesystem type name (or regex pattern) to filter by."
@@ -658,7 +721,7 @@ class SEToolsMCPServer:
 
         return self._collect_results(q, max_results=max_results)
 
-    def setools_list_initialsids(
+    def setools_tool_list_initialsids(
         self,
         name: Annotated[
             str | None, "Initial SID name (or regex pattern) to filter by."
@@ -674,7 +737,7 @@ class SEToolsMCPServer:
 
         return self._collect_results(q, max_results=max_results)
 
-    def setools_list_portcons(
+    def setools_tool_list_portcons(
         self,
         ports: Annotated[
             str | None,
@@ -710,7 +773,7 @@ class SEToolsMCPServer:
 
         return self._collect_results(q, max_results=max_results)
 
-    def setools_list_netifcons(
+    def setools_tool_list_netifcons(
         self,
         name: Annotated[
             str | None, "Network interface name (or regex pattern) to filter by."
@@ -726,7 +789,7 @@ class SEToolsMCPServer:
 
         return self._collect_results(q, max_results=max_results)
 
-    def setools_list_nodecons(
+    def setools_tool_list_nodecons(
         self,
         network: Annotated[
             str | None,
@@ -747,7 +810,7 @@ class SEToolsMCPServer:
 
         return self._collect_results(q, max_results=max_results)
 
-    def setools_list_ibpkeycons(
+    def setools_tool_list_ibpkeycons(
         self,
         pkeys: Annotated[
             str | None,
@@ -779,7 +842,7 @@ class SEToolsMCPServer:
 
         return self._collect_results(q, max_results=max_results)
 
-    def setools_list_ibendportcons(
+    def setools_tool_list_ibendportcons(
         self,
         name: Annotated[
             str | None, "Infiniband device name (or regex pattern) to filter by."
@@ -797,7 +860,7 @@ class SEToolsMCPServer:
 
         return self._collect_results(q, max_results=max_results)
 
-    def setools_list_iomemcons(
+    def setools_tool_list_iomemcons(
         self,
         addr: Annotated[
             str | None,
@@ -824,7 +887,7 @@ class SEToolsMCPServer:
 
         return self._collect_results(q, max_results=max_results)
 
-    def setools_list_ioportcons(
+    def setools_tool_list_ioportcons(
         self,
         ports: Annotated[
             str | None,
@@ -852,7 +915,7 @@ class SEToolsMCPServer:
 
         return self._collect_results(q, max_results=max_results)
 
-    def setools_list_pcidevicecons(
+    def setools_tool_list_pcidevicecons(
         self,
         device: Annotated[
             str | None, "PCI device address in hex to filter by, e.g. '0xc800'."
@@ -866,7 +929,7 @@ class SEToolsMCPServer:
 
         return self._collect_results(q, max_results=max_results)
 
-    def setools_list_pirqcons(
+    def setools_tool_list_pirqcons(
         self,
         irq: Annotated[int | None, "IRQ number to filter by."] = None,
         max_results: Annotated[int, "Maximum number of results."] = 200,
@@ -878,7 +941,7 @@ class SEToolsMCPServer:
 
         return self._collect_results(q, max_results=max_results)
 
-    def setools_list_devicetreecons(
+    def setools_tool_list_devicetreecons(
         self,
         path: Annotated[
             str | None, "Device tree path (or regex pattern) to filter by."
@@ -894,7 +957,7 @@ class SEToolsMCPServer:
 
         return self._collect_results(q, max_results=max_results)
 
-    def setools_analyze_dta(
+    def setools_tool_analyze_dta(
         self,
         mode: Annotated[
             str,
@@ -977,7 +1040,7 @@ class SEToolsMCPServer:
 
         return self._serialize_results(results, len(results), truncated)
 
-    def setools_analyze_info_flow(
+    def setools_tool_analyze_info_flow(
         self,
         mode: Annotated[
             str,
@@ -1062,7 +1125,7 @@ class SEToolsMCPServer:
 
         return self._serialize_results(results, len(results), truncated)
 
-    def setools_diff_policies(
+    def setools_tool_diff_policies(
         self,
         left_policy: Annotated[str, "Path to the left (baseline) policy file."],
         right_policy: Annotated[str, "Path to the right (new) policy file."],
@@ -1223,3 +1286,31 @@ class SEToolsMCPServer:
             }
 
         return self._serialize_results(differences, count, any_truncated)
+
+    def setools_tool_lookup_file_context(
+        self,
+        path: Annotated[str, "The file path to look up in the file_contexts."],
+        filetype: Annotated[
+            str | None,
+            "File type to match. Valid values: any, file, dir, chr_file, blk_file, "
+            "sock_file, fifo_file, lnk_file. If omitted, defaults to 'any'.",
+        ] = None,
+        fc_path: Annotated[
+            str | None,
+            "Path to a file_contexts file. If omitted, uses the system default.",
+        ] = None,
+    ) -> str:
+        """
+        Look up the SELinux file context for a given path.
+
+        Returns the security context that would be assigned to the specified
+        path according to the file_contexts configuration.
+
+        Use this instead of a naive text search, as it properly evaluates the
+        file context rules, including regex precedence and file type specifiers.
+        """
+        ft = FileContextsFiletype[filetype] if filetype else FileContextsFiletype.any
+
+        fc = self._load_file_contexts(fc_path)
+        result = fc.lookup(path, ft)
+        return self._serialize_results(result, 1, False)
